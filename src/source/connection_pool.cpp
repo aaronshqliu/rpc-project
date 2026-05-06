@@ -12,10 +12,10 @@ ConnectionPool::~ConnectionPool()
     std::lock_guard<std::mutex> lock(mutex);
 
     // 清理所有待在池子里的空闲连接
-    for (auto &pair : pool) {
-        while (!pair.second.empty()) {
-            ConnectionItem item = pair.second.front();
-            pair.second.pop();
+    for (auto &[key, q] : pool) {
+        while (!q.empty()) {
+            ConnectionItem item = q.front();
+            q.pop();
             if (item.fd != -1) {
                 close(item.fd);
             }

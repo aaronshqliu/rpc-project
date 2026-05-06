@@ -27,17 +27,20 @@ protobuf_generate_cpp(RPC_PROTO_SRCS RPC_PROTO_HDRS src/rpc_header.proto)
 add_library(myrpc STATIC ${RPC_SOURCES} ${RPC_PROTO_SRCS})
 
 # 配置 myrpc 的头文件搜索路径
-target_include_directories(myrpc PUBLIC 
-    ${CMAKE_SOURCE_DIR}/src/include 
+target_include_directories(myrpc PUBLIC
+    ${CMAKE_SOURCE_DIR}/src/include
     ${CMAKE_CURRENT_BINARY_DIR} # Protobuf 生成的 pb.h 文件存放位置
 )
 
+# 添加 THREADED 宏定义
+target_compile_definitions(myrpc PRIVATE THREADED)
+
 # 配置 myrpc 需要链接的第三方库
-target_link_libraries(myrpc PUBLIC 
-    ${Protobuf_LIBRARIES} 
+target_link_libraries(myrpc PUBLIC
+    ${Protobuf_LIBRARIES}
     muduo_net
     muduo_base
-    zookeeper_mt 
+    zookeeper_mt
     glog
 )
 
@@ -45,8 +48,8 @@ target_link_libraries(myrpc PUBLIC
 # 第二部分：编译业务层示例程序
 # =========================================================
 # 自动编译 example 目录下的 protobuf 文件
-protobuf_generate_cpp(EXAMPLE_PROTO_SRCS EXAMPLE_PROTO_HDRS 
-    example/user.proto 
+protobuf_generate_cpp(EXAMPLE_PROTO_SRCS EXAMPLE_PROTO_HDRS
+    example/user.proto
     example/order.proto
 )
 
@@ -57,23 +60,23 @@ include_directories(
 )
 
 # ---- 编译 Server 程序 ----
-add_executable(user_server 
-    example/user_server.cpp 
-    example/user_service.cpp 
+add_executable(user_server
+    example/user_server.cpp
+    example/user_service.cpp
     ${EXAMPLE_PROTO_SRCS}
 )
 target_link_libraries(user_server PRIVATE myrpc)
 
-add_executable(order_server 
-    example/order_server.cpp 
-    example/order_service.cpp 
+add_executable(order_server
+    example/order_server.cpp
+    example/order_service.cpp
     ${EXAMPLE_PROTO_SRCS}
 )
 target_link_libraries(order_server PRIVATE myrpc)
 
 # ---- 编译 Client 程序 ----
-add_executable(client 
-    example/client.cpp 
+add_executable(client
+    example/client.cpp
     ${EXAMPLE_PROTO_SRCS}
 )
 target_link_libraries(client PRIVATE myrpc)
