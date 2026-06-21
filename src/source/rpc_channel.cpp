@@ -212,8 +212,8 @@ MyRpcChannel::ServiceHost MyRpcChannel::QueryZkForHost(const std::string &servic
         }
     }
 
-    // 2. 缓存未命中，去 ZK 查询
     std::shared_ptr<ServiceNodeList> node_list = nullptr;
+    // 2. 缓存未命中，去 ZK 查询
     {
         std::unique_lock<std::shared_mutex> write_lock(cache_mutex);
         // 防止多个线程同时发现缓存为空，阻塞在锁外，拿到锁后重复查询ZK
@@ -222,14 +222,13 @@ MyRpcChannel::ServiceHost MyRpcChannel::QueryZkForHost(const std::string &servic
             node_list = it->second;
         } else {  // 真正去请求 ZooKeeper，并开启 Watcher
             ZkClient &zk = RpcApplication::GetInstance().GetZkClient();
-            std::vector<std::string> available_hosts;
 
+            std::vector<std::string> available_hosts;
             if (!zk.GetChildren(path.c_str(), available_hosts, true)) {
                 // 情况 A：ZK 挂了。因为此时缓存也为空，我们实在找不到节点了
                 LOG(ERROR) << "ZK is DOWN and no local cache for: " << path;
                 return {"", 0};
             }
-
             if (available_hosts.empty()) {
                 // 情况 B：ZK 正常，但该服务确实一个 Provider 都没有
                 LOG(ERROR) << "Service exist in ZK but has NO instances: " << path;

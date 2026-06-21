@@ -35,23 +35,20 @@
 ### 环境依赖
 
   * Ubuntu
-  * CMake 3.10+
-  * GCC 11.4.0
-  * Protobuf 3.x
-  * ZooKeeper Client C API
-  * Muduo 网络库
+  * GCC
+  * CMake
+  * Boost
+  * Glog
+  * Protobuf
+  * ZooKeeper
+  * Muduo
 
 ### 快速构建
 
 ```bash
-# 克隆项目
 git clone https://github.com/aaronshqliu/rpc_project.git
-cd rpc_project
-
-# 编译
-mkdir build && cd build
-cmake ..
-make
+chmod +x build.sh
+./build.sh
 ```
 
 ### 运行示例
