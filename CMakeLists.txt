@@ -5,6 +5,19 @@ project(MyRpcProject)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# 如果命令行没有指定 CMAKE_BUILD_TYPE，则默认设置为 Release
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Choose the type of build, options are: None Debug Release RelWithDebInfo MinSizeRel." FORCE)
+endif()
+
+message(STATUS "=== 当前 RPC 框架构建模式: ${CMAKE_BUILD_TYPE} ===")
+
+# Debug 模式参数: 开启 gdb 调试信息，关闭所有优化 (-O0)
+set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
+
+# Release 模式参数: 开启最高级别优化 (-O3)，并定义 NDEBUG 关闭 assert 断言
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
+
 # 2. 寻找系统依赖包
 find_package(Protobuf REQUIRED)
 

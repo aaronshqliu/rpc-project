@@ -15,6 +15,16 @@ void MyRpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method
                               ::google::protobuf::Message *response,
                               ::google::protobuf::Closure *done)
 {
+    // 定义一个局部的守护类（RAII 自动守护），C++ 局部变量出作用域会自动调用析构函数，保证 done->Run() 100% 被调用一次。
+    struct ClosureGuard {
+        ::google::protobuf::Closure *cb;
+        ~ClosureGuard() {
+            if (cb) {
+                cb->Run();
+            }
+        }
+    } guard {done};
+
     std::string service_name = method->service()->name();
     std::string method_name = method->name();
 
@@ -68,13 +78,13 @@ void MyRpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method
         // 4.1 每次循环都重新获取地址 (触发轮询负载均衡算法)
         ServiceHost host = QueryZkForHost(service_name, method_name);
         if (host.ip.empty()) {
-            LOG(WARNING) << "Retry " << i << ": Query ZK failed for " << service_name;
-            if (i == max_retries) {  // 如果是最后一次循环了，才设置最终的失败状态
-                controller->SetFailed("RPC Failed: Cannot find service providers in ZK after retries.");
-                return; // 彻底退出 RPC 调用
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(i * 10));  // 还没到最后一次，睡一会儿再查，给 ZK 恢复的时间
-            continue;
+            // 快速失败
+            // 既然命中了空占位符，说明知道服务全挂了。
+            LOG_EVERY_N(ERROR, 100000) << "Fast-Fail: No providers available for " << service_name 
+                                       << " (Waiting for ZK Watcher to recover)";
+                                       
+            controller->SetFailed("RPC Failed: Service is OFFLINE (No providers).");
+            return;
         }
 
         // 4.2 从连接池获取连接
@@ -89,18 +99,12 @@ void MyRpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method
                 return; 
             }
 
-            if (errno == ECONNREFUSED || errno == ETIMEDOUT) {
-                // 这是明确的服务端宕机或网络不通的信号，执行剔除。
-                LOG(WARNING) << "Server dead or unreachable. Removing invalid host: " << host.ip << ":" << host.port;
-                std::string zk_path = "/" + service_name + "/" + method_name;
-                RemoveInvalidHost(zk_path, host);
-            }
+            // 这是明确的服务端宕机或网络不通的信号，执行剔除。
+            LOG(WARNING) << "Server dead or unreachable. Removing invalid host: " << host.ip << ":" << host.port;
+            std::string zk_path = "/" + service_name + "/" + method_name;
+            RemoveInvalidHost(zk_path, host);
 
             continue; // 重试下一台
-        } else if (client_fd == -2) {  // 连接池已满：服务器健康，只是太忙了，不要剔除它。
-            LOG(WARNING) << "Host is too busy (connection pool full): " << host.ip << ":" << host.port;
-            std::this_thread::sleep_for(std::chrono::milliseconds(i * 10)); // 睡一小会儿，给服务端喘息的时间，也给别的线程归还连接的时间
-            continue; // 重试，轮询去尝试下一台机器
         }
 
         // 5. 连接成功，跳出重试循环，进入数据收发阶段
@@ -176,7 +180,6 @@ void MyRpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method
 
     // --- 退出重试循环后的兜底逻辑 ---
     if (!rpc_success) {
-        //【分支 A：本地夭折】请求没有成功交发给网络层
         // 拦截隐性耗尽
         if (!controller->Failed()) {  
             controller->SetFailed("RPC Call failed: Exhausted all " +
@@ -184,41 +187,43 @@ void MyRpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method
         }
         LOG(ERROR) << "RPC Call aborted. Final error: " << controller->ErrorText();
 
-        // 必须立刻调用 done，通知外层业务 RPC 失败了，别等了。
-        if (done != nullptr) {
-            done->Run();
-        }
-
         // 拦截执行，绝对不要往下走了
         return; 
     }
 
-    // 【分支 B：成功发送】
     // 如果代码能走到这里，说明 rpc_success == true，意味着 response 已经被成功解析赋值了！
-    if (done != nullptr) {
-        done->Run();
-    }
+    // 函数执行到最后一行自然结束，局部变量 guard 出栈，自动触发 done->Run()
 }
 
 MyRpcChannel::ServiceHost MyRpcChannel::QueryZkForHost(const std::string &service_name, const std::string &method_name)
 {
     std::string path = "/" + service_name + "/" + method_name;
+
     // 1. 尝试从缓存获取 (加读锁，允许多线程并发读)
     {
         std::shared_lock<std::shared_mutex> read_lock(cache_mutex);
         auto it = host_cache.find(path);
-        if (it != host_cache.end() && it->second && !it->second->hosts.empty()) {
+        if (it != host_cache.end() && it->second) {
+            if (it->second->hosts.empty()) {
+                // 命中了“宕机占位符”，说明知道没有节点，直接返回空，绝不去查 ZK
+                return {"", 0};
+            }
             return GetHostByRoundRobin(it->second);
         }
     }
 
     std::shared_ptr<ServiceNodeList> node_list = nullptr;
+
     // 2. 缓存未命中，去 ZK 查询
     {
         std::unique_lock<std::shared_mutex> write_lock(cache_mutex);
+
         // 防止多个线程同时发现缓存为空，阻塞在锁外，拿到锁后重复查询ZK
         auto it = host_cache.find(path);
-        if (it != host_cache.end() && it->second && !it->second->hosts.empty()) {
+        if (it != host_cache.end() && it->second) {
+            if (it->second->hosts.empty()) {
+                return {"", 0}; 
+            }
             node_list = it->second;
         } else {  // 真正去请求 ZooKeeper，并开启 Watcher
             ZkClient &zk = RpcApplication::GetInstance().GetZkClient();
@@ -231,7 +236,16 @@ MyRpcChannel::ServiceHost MyRpcChannel::QueryZkForHost(const std::string &servic
             }
             if (available_hosts.empty()) {
                 // 情况 B：ZK 正常，但该服务确实一个 Provider 都没有
-                LOG(ERROR) << "Service exist in ZK but has NO instances: " << path;
+                auto empty_list = std::make_shared<ServiceNodeList>();
+                host_cache[path] = empty_list;
+
+                LOG_EVERY_N(ERROR, 10000) << "Service exist in ZK but has NO instances: " << path;
+
+                // 即使冷启动时没有实例，也必须注册 Watcher，否则这个服务以后上线了，客户端将永远无法感知
+                zk.SubscribeWatcher(path, [this](int type, const std::string &changed_path) {
+                    this->BackgroundRefreshCache(changed_path);
+                });
+
                 return {"", 0};
             }
 
@@ -323,14 +337,20 @@ void MyRpcChannel::BackgroundRefreshCache(const std::string &path)
 
     // 2. 解析新的节点数据
     std::vector<ServiceHost> parsed_hosts = ParseHostStrings(new_host_strs);
+    int new_node_count = parsed_hosts.size();
+    LOG(INFO) << "--------------------------------------------------";
+    LOG(INFO) << "[Service Discovery] Path: " << path << " (NODE CHANGED)";
+    LOG(INFO) << "[Service Discovery] Status: " << (new_node_count > 0 ? "ONLINE" : "OFFLINE");
+    LOG(INFO) << "[Service Discovery] Instances Found: " << new_node_count;
+    LOG(INFO) << "--------------------------------------------------";
 
-    // 3. 如果全宕机了，只能清空，根本不需要分配新内存，直接进锁清理即可
+    // 3. 如果全宕机了，保留缓存键，塞入空列表挡住洪峰，防止缓存击穿
     if (parsed_hosts.empty()) {
+        auto empty_list = std::make_shared<ServiceNodeList>();
+
         std::unique_lock<std::shared_mutex> write_lock(cache_mutex);
-        if (auto it = host_cache.find(path); it != host_cache.end()) {
-            host_cache.erase(it);
-        }
-        LOG(WARNING) << "All nodes down for path: " << path << ". Cache cleared.";
+        host_cache[path] = empty_list; // 覆盖旧缓存，而不是 erase
+        LOG(WARNING) << "All nodes down for path: " << path << ". Empty cache updated.";
         return;
     }
 
@@ -347,7 +367,6 @@ void MyRpcChannel::BackgroundRefreshCache(const std::string &path)
             host_cache[path] = new_list;
         }
     }
-    LOG(INFO) << "Background refresh success for path: " << path << ", new node count: " << new_list->hosts.size();
 }
 
 std::vector<MyRpcChannel::ServiceHost> MyRpcChannel::ParseHostStrings(const std::vector<std::string> &host_strs)

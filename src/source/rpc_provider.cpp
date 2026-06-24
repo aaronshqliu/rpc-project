@@ -3,8 +3,11 @@
 #include "rpc_header.pb.h"
 #include "zk_client.h"
 
+#include <chrono>
 #include <glog/logging.h>
 #include <muduo/net/InetAddress.h>
+#include <signal.h>
+#include <thread>
 
 // 自定义 Closure 类，接受一个 Lambda 表达式
 class RpcClosure : public google::protobuf::Closure {
@@ -43,8 +46,60 @@ void RpcProvider::NotifyService(google::protobuf::Service *service)
     service_map.try_emplace(service_desc->name(), std::move(info));
 }
 
+void RpcProvider::IncrementActiveRequest()
+{
+    active_request_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+void RpcProvider::DecrementActiveRequest()
+{
+    if (active_request_count.fetch_sub(1, std::memory_order_relaxed) == 1) {
+        shutdown_cv.notify_all();
+    }
+}
+
 void RpcProvider::Run()
 {
+    // 1. 启动优雅停机专属守护线程
+    std::thread([this]() {
+        sigset_t wait_set;
+        sigemptyset(&wait_set);
+        sigaddset(&wait_set, SIGINT);
+        sigaddset(&wait_set, SIGTERM);
+
+        int sig;
+        // sigwait 会在这里死等。直到外界发来 SIGINT 或 SIGTERM，它才会往下走。
+        // 因为它是同步往下走的，所以这里执行的所有代码都是绝对安全的普通线程上下文。
+        sigwait(&wait_set, &sig);
+
+        LOG(INFO) << "===========================================";
+        LOG(INFO) << "Received signal " << sig << ", starting graceful shutdown...";
+
+        // 第一步：主动断开 ZK，摘除流量
+        RpcApplication::GetInstance().GetZkClient().Close();
+        LOG(INFO) << "ZK session closed. Stop accepting new requests...";
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+        // 第二步：保持 muduo 运行，超时兜底 5 秒
+        {
+            std::unique_lock<std::mutex> lock(shutdown_mutex);
+            if (bool clean_exit = shutdown_cv.wait_for(lock, std::chrono::seconds(5), [] {
+                return active_request_count.load(std::memory_order_relaxed) == 0;
+            }); clean_exit) {
+                LOG(INFO) << "All in-flight requests completed gracefully. Exiting immediately.";
+            } else {
+                LOG(WARNING) << "Timeout (5s) waiting for in-flight requests. Force shutting down!";
+            }
+        }
+
+        // 第三步：平滑停止网络服务
+        this->event_loop.quit();
+    }).detach();
+
+    // 2. 正常启动 muduo 服务
+    LOG(INFO) << "RpcProvider is running...";
+
     // 读取配置（IP + port）
     ip = RpcApplication::GetInstance().GetConfig().GetString("rpc_server_ip");
     port = atoi(RpcApplication::GetInstance().GetConfig().GetString("rpc_server_port").c_str());
@@ -242,6 +297,9 @@ void RpcProvider::OnMessage(const muduo::net::TcpConnectionPtr &conn,
                 LOG(WARNING) << "Client disconnected before sending response. Aborting serialize.";
                 delete request;
                 delete response;
+
+                // 如果客户端提前断开，请求作废，活跃请求 -1
+                DecrementActiveRequest();
                 return;
             }
 
@@ -278,7 +336,13 @@ void RpcProvider::OnMessage(const muduo::net::TcpConnectionPtr &conn,
 
             delete request;
             delete response;
+
+            // 正常响应发送完毕并清理内存后，活跃请求 -1
+            DecrementActiveRequest();
         });
+
+        // 准备将请求交给业务层，活跃请求 +1
+        IncrementActiveRequest();
 
         // 调用业务逻辑：Register、Login、MakeOrder等，这里可以放到线程池中完成
         service->CallMethod(method, nullptr, request, response, done);

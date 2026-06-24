@@ -3,6 +3,7 @@
 #include <muduo/base/Logging.h>
 #include <glog/logging.h>
 #include <iostream>
+#include <signal.h>
 #include <unistd.h>
 
 RpcApplication &RpcApplication::GetInstance()
@@ -13,6 +14,14 @@ RpcApplication &RpcApplication::GetInstance()
 
 void RpcApplication::Init(int argc, char **argv)
 {
+    // 信号隔离：屏蔽当前线程（也就是主线程）的 SIGINT 和 SIGTERM
+    // 这样后续所有由主线程派生出来的业务线程、Muduo 网络线程，都会继承这个掩码，免疫这些信号。
+    sigset_t set;  // 声明一个信号集变量 set
+    sigemptyset(&set);  // 将里面的所有位都清零
+    sigaddset(&set, SIGINT);  // SIGINT 是中断信号，Ctrl + C
+    sigaddset(&set, SIGTERM); // SIGTERM是终止信号，kill <pid>（不带 -9 参数）
+    pthread_sigmask(SIG_BLOCK, &set, nullptr);  // 对于当前调用这行代码的线程（main 主线程），把 set 里的信号（即 SIGINT 和 SIGTERM）屏蔽掉
+
     if (argc < 2) {
         LOG(ERROR) << "Usage: " << argv[0] << " -i <config_file>";
         exit(EXIT_FAILURE);

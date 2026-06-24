@@ -3,8 +3,22 @@
 # 遇到错误立即退出，未定义的变量报错
 set -eu
 
+# 默认使用 Release 模式
+BUILD_TYPE="Release"
+
+if [ "$#" -ge 1 ]; then
+    if [ "$1" = "--debug" ]; then
+        BUILD_TYPE="Debug"
+    else
+        echo "警告: 未知参数 '$1'。"
+        echo "用法: ./build.sh [--debug]"
+        echo "将默认使用 Release 模式继续..."
+        sleep 2
+    fi
+fi
+
 echo "================================================="
-echo "🚀 开始环境配置与构建 RPC 项目..."
+echo "开始环境配置与构建 RPC 项目(当前模式: $BUILD_TYPE)..."
 echo "================================================="
 
 # 1. 安装系统级依赖
@@ -65,9 +79,10 @@ fi
 
 mkdir build
 cd build
-cmake ..
+# 将解析出的 BUILD_TYPE 传递给 CMake
+cmake -DCMAKE_BUILD_TYPE=$BUILD_TYPE ..
 make -j$(nproc)
 
 echo "================================================="
-echo "✅ 环境配置与编译全部完成!"
+echo "✅ 环境配置与编译全部完成! (模式: $BUILD_TYPE)"
 echo "================================================="

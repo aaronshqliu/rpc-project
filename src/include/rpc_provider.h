@@ -5,6 +5,8 @@
 #include <google/protobuf/service.h>
 #include <muduo/net/EventLoop.h>
 #include <muduo/net/TcpServer.h>
+
+#include <condition_variable>
 #include <unordered_map>
 
 // RpcProvider类，负责发布服务和启动RPC服务器
@@ -16,6 +18,10 @@ public:
     void Run();
     muduo::net::EventLoop* GetEventLoop();
 
+    // 暴露给底层网络回调的接口，用于加减计数器
+    static void IncrementActiveRequest();
+    static void DecrementActiveRequest();
+
 private:
     void OnConnection(const muduo::net::TcpConnectionPtr &conn);
 
@@ -25,6 +31,10 @@ private:
 
     // 将 service_map 中的所有服务重新发布到 ZK
     void RegisterServiceToZk();
+
+    inline static std::atomic<int> active_request_count {0};  // 活跃请求计数器
+    inline static std::mutex shutdown_mutex;  // 用于停机线程阻塞等待的互斥锁和条件变量
+    inline static std::condition_variable shutdown_cv;
 
     // ServiceInfo结构体用来存储某一个具体服务的所有信息。在 Protobuf 的概念里，一个 Service（服务）往往包含多个 Method（方法）。
     struct ServiceInfo {

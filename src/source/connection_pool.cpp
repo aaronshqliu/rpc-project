@@ -7,15 +7,21 @@
 #include <glog/logging.h>
 #include <netinet/tcp.h>
 
+ConnectionPool& ConnectionPool::GetInstance()
+{
+    static ConnectionPool pool;
+    return pool;
+}
+
 ConnectionPool::~ConnectionPool()
 {
-    std::lock_guard<std::mutex> lock(mutex);
-
-    // 清理所有待在池子里的空闲连接
-    for (auto &[key, q] : pool) {
-        while (!q.empty()) {
-            ConnectionItem item = q.front();
-            q.pop();
+    std::lock_guard<std::mutex> global_lock(global_mutex);
+    for (auto &[key, hp] : pool) {
+        // 使用局部锁清理各自的队列
+        std::lock_guard<std::mutex> local_lock(hp->pool_mutex);
+        while (!hp->free_queue.empty()) {
+            ConnectionItem item = hp->free_queue.front();
+            hp->free_queue.pop();
             if (item.fd != -1) {
                 close(item.fd);
             }
@@ -105,9 +111,9 @@ bool ConnectionPool::Ping(int fd)
     
     myrpc::RpcResponseHeader pong_header;
     if (pong_header.ParseFromArray(&recv_buf[4], recv_header_size)) {
-        // 校验确实是 PONG！
+        // 校验确实是 PONG
         if (pong_header.msg_type() == myrpc::PONG && pong_header.errcode() == 0) {
-            return true; // 连接绝对健康！
+            return true; // 连接绝对健康
         }
     }
 
@@ -119,23 +125,50 @@ int ConnectionPool::GetConnection(const std::string &ip, uint16_t port)
     std::string key = ip + ":" + std::to_string(port);
 
     while (true) {
+        HostPool *hp = nullptr;
+        // 【第一阶段：全局锁】只负责查字典
+        {
+            std::lock_guard<std::mutex> global_lock(global_mutex);
+            if (pool.find(key) == pool.end()) {
+                pool[key] = std::make_unique<HostPool>();
+            }
+            hp = pool[key].get();
+        } // 全局锁释放，此时请求不同 IP 的线程彻底分道扬镳
+
         int fd = -1;
         std::chrono::steady_clock::time_point last_active;
+        bool need_create = false;
 
+        // 【第二阶段：局部锁】在各自的池子里处理排队和拿取
         {
-            std::lock_guard<std::mutex> lock(mutex);
-            if (pool.find(key) != pool.end() && !pool[key].empty()) {
-                auto item = pool[key].front();
-                pool[key].pop();
+            std::unique_lock<std::mutex> local_lock(hp->pool_mutex);
+            
+            hp->cv.wait(local_lock, [hp]() {
+                return !hp->free_queue.empty() || hp->total_created < hp->max_connections;
+            });
 
+            if (!hp->free_queue.empty()) {
+                auto item = hp->free_queue.front();
+                hp->free_queue.pop();
                 fd = item.fd;
                 last_active = item.last_active_time;
+            } else {
+                hp->total_created++; 
+                need_create = true;
             }
-        }
+        }  // 局部锁释放
 
-        // 如果池子里面没拿到，直接跳出循环去新建
-        if (fd == -1) {
-            return CreateNewConnection(ip, port);
+        // 【第三阶段：无锁操作】去底层建连或执行 Ping
+        if (need_create) {
+            fd = CreateNewConnection(ip, port);
+            if (fd == -1) {
+                // 建连失败，重获局部锁退回名额
+                std::lock_guard<std::mutex> local_lock(hp->pool_mutex);
+                hp->total_created--;
+                hp->cv.notify_one();
+                return -1;
+            }
+            return fd; // 新建成功，返回給业务
         }
 
         // 拿到了，在【无锁】状态下进行空闲判断和 Ping 测试。
@@ -164,15 +197,45 @@ void ConnectionPool::ReleaseConnection(const std::string &ip, uint16_t port, int
     if (fd == -1) {
         return;
     }
+
     std::string key = ip + ":" + std::to_string(port);
-    std::lock_guard<std::mutex> lock(mutex);
-    pool[key].emplace(fd, std::chrono::steady_clock::now());
+    HostPool* hp = nullptr;
+
+    {
+        std::lock_guard<std::mutex> global_lock(global_mutex);
+        if (pool.find(key) != pool.end()) {
+            hp = pool[key].get();
+        }
+    }
+
+    // 找到目标后，脱离全局锁，只用局部锁放回连接
+    if (hp) {
+        std::lock_guard<std::mutex> local_lock(hp->pool_mutex);
+        hp->free_queue.emplace(fd, std::chrono::steady_clock::now());
+        hp->cv.notify_one(); 
+    }
 }
 
 void ConnectionPool::CloseConnection(const std::string &ip, uint16_t port, int fd)
 {
     if (fd != -1) {
-        close(fd);
+        close(fd); 
+        std::string key = ip + ":" + std::to_string(port);
+        HostPool* hp = nullptr;
+
+        {
+            std::lock_guard<std::mutex> global_lock(global_mutex);
+            if (pool.find(key) != pool.end()) {
+                hp = pool[key].get();
+            }
+        }
+
+        // 找到目标后，脱离全局锁，只用局部锁腾出名额
+        if (hp) {
+            std::lock_guard<std::mutex> local_lock(hp->pool_mutex);
+            hp->total_created--;  
+            hp->cv.notify_one();  
+        }
     }
 }
 

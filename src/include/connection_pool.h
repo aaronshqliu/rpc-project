@@ -1,6 +1,7 @@
 #ifndef CONNECTION_POOL_H
 #define CONNECTION_POOL_H
 
+#include <condition_variable>
 #include <chrono>
 #include <memory>
 #include <mutex>
@@ -11,16 +12,11 @@
 class ConnectionPool {
 public:
     // 获取全局单例
-    static ConnectionPool &GetInstance()
-    {
-        static ConnectionPool pool;
-        return pool;
-    }
+    static ConnectionPool &GetInstance();
 
     // 从连接池获取一个可用的连接
     // 返回 > 0：成功拿到 fd。
     // 返回 -1：网络建连失败（服务器挂了）。
-    // 返回 -2：达到最大连接数上限（服务器正忙）。
     int GetConnection(const std::string &ip, uint16_t port);
 
     // 将健康的连接放回连接池
@@ -85,8 +81,16 @@ private:
      * 优先级队列通常用于处理非同质化的任务（比如带权重的网络包、不同优先级的定时器任务）。而在同一个 ConnectionPool 中，所有的 ConnectionItem 都是指向同一个服务端的。
      * 它们在功能上是完全等价的、高度同质化的。因此，给它们赋予“优先级”并进行复杂的调度，在业务逻辑上是多此一举。
      */
-    std::unordered_map<std::string, std::queue<ConnectionItem>> pool; // 空闲连接池：Key 为 "ip:port"，Value 为可用的 fd 队列
-    std::mutex mutex;
+    struct HostPool {
+        std::queue<ConnectionItem> free_queue;  // 空闲连接池
+        int total_created = 0;
+        std::mutex pool_mutex;
+        std::condition_variable cv;
+        const int max_connections = 64;
+    };
+
+    std::unordered_map<std::string, std::unique_ptr<HostPool>> pool;
+    std::mutex global_mutex;
 };
 
 #endif // CONNECTION_POOL_H
