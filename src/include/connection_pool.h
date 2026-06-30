@@ -1,6 +1,8 @@
 #ifndef CONNECTION_POOL_H
 #define CONNECTION_POOL_H
 
+#include "rpc_endpoint.h"
+
 #include <condition_variable>
 #include <chrono>
 #include <memory>
@@ -17,20 +19,20 @@ public:
     // 从连接池获取一个可用的连接
     // 返回 > 0：成功拿到 fd。
     // 返回 -1：网络建连失败（服务器挂了）。
-    int GetConnection(const std::string &ip, uint16_t port);
+    int GetConnection(const RpcEndpoint &endpoint);
 
     // 将健康的连接放回连接池
-    void ReleaseConnection(const std::string &ip, uint16_t port, int fd);
+    void ReleaseConnection(const RpcEndpoint &endpoint, int fd);
 
     // 销毁坏掉的连接
-    void CloseConnection(const std::string &ip, uint16_t port, int fd);
+    void CloseConnection(const RpcEndpoint &endpoint, int fd);
 
 private:
     ConnectionPool() = default;
     ~ConnectionPool();
 
     // 内部创建新连接的逻辑
-    int CreateNewConnection(const std::string &ip, uint16_t port);
+    int CreateNewConnection(const RpcEndpoint &endpoint);
 
     bool Ping(int fd);
 
@@ -89,7 +91,7 @@ private:
         const int max_connections = 64;
     };
 
-    std::unordered_map<std::string, std::unique_ptr<HostPool>> pool;
+    std::unordered_map<RpcEndpoint, std::unique_ptr<HostPool>, RpcEndpointHash> pool;
     std::mutex global_mutex;
 };
 

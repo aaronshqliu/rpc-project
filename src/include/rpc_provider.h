@@ -1,10 +1,15 @@
 #ifndef RPC_PROVIDER_H
 #define RPC_PROVIDER_H
 
+#include "rpc_endpoint.h"
+
 #include <google/protobuf/descriptor.h>
 #include <google/protobuf/service.h>
 #include <muduo/net/EventLoop.h>
 #include <muduo/net/TcpServer.h>
+#include <muduo/net/http/HttpServer.h>
+#include <muduo/net/http/HttpRequest.h>
+#include <muduo/net/http/HttpResponse.h>
 
 #include <condition_variable>
 #include <unordered_map>
@@ -18,10 +23,6 @@ public:
     void Run();
     muduo::net::EventLoop* GetEventLoop();
 
-    // 暴露给底层网络回调的接口，用于加减计数器
-    static void IncrementActiveRequest();
-    static void DecrementActiveRequest();
-
 private:
     void OnConnection(const muduo::net::TcpConnectionPtr &conn);
 
@@ -32,9 +33,19 @@ private:
     // 将 service_map 中的所有服务重新发布到 ZK
     void RegisterServiceToZk();
 
-    inline static std::atomic<int> active_request_count {0};  // 活跃请求计数器
-    inline static std::mutex shutdown_mutex;  // 用于停机线程阻塞等待的互斥锁和条件变量
-    inline static std::condition_variable shutdown_cv;
+    // 暴露给底层网络回调的接口，用于加减计数器
+    void IncrementActiveRequest();
+    void DecrementActiveRequest();
+
+    // HTTP 请求的回调函数
+    void OnMetricsRequest(const muduo::net::HttpRequest& req, muduo::net::HttpResponse* resp);
+
+    std::atomic<int> active_request_count {0};  // 活跃请求计数器
+    std::mutex shutdown_mutex;  // 用于停机线程阻塞等待的互斥锁和条件变量
+    std::condition_variable shutdown_cv;
+
+    std::atomic<int64_t> total_requests {0};
+    std::atomic<int64_t> error_requests {0};
 
     // ServiceInfo结构体用来存储某一个具体服务的所有信息。在 Protobuf 的概念里，一个 Service（服务）往往包含多个 Method（方法）。
     struct ServiceInfo {
@@ -50,8 +61,11 @@ private:
     muduo::net::EventLoop event_loop;
     std::unique_ptr<muduo::net::TcpServer> tcp_server;
 
-    std::string ip;   // 缓存服务器IP
-    uint16_t port;    // 缓存服务器端口
+    RpcEndpoint server_endpoint;
+    std::string server_name;
+
+    // 用于暴露 Metrics 的 HTTP 服务器
+    std::unique_ptr<muduo::net::HttpServer> http_server;
 };
 
 #endif // RPC_PROVIDER_H

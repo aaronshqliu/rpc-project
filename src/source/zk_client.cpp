@@ -10,6 +10,7 @@ void global_watcher(zhandle_t *zh, int type, int state, const char *path, void *
     // 1. 处理连接状态
     if (type == ZOO_SESSION_EVENT) {
         if (state == ZOO_CONNECTED_STATE) {
+            LOG(INFO) << "[ZK Event] Session Connected successfully!";
             client->NotifyConnected(); // 调用 ZkClient 的 NotifyConnected 方法，通知连接成功
         } else if (state == ZOO_EXPIRED_SESSION_STATE) {
             LOG(ERROR) << "ZK Session Expired! Attempting to reconnect...";
@@ -17,10 +18,20 @@ void global_watcher(zhandle_t *zh, int type, int state, const char *path, void *
             std::thread([client]() {
                 client->Reconnect();
             }).detach();
+        } else {
+            LOG(WARNING) << "[ZK Event] Session state changed to: " << state; 
         }
     }
     // 2. 处理子节点变动
     else {
+        std::string event_type_str = "UNKNOWN";
+        if (type == ZOO_CREATED_EVENT) event_type_str = "CREATED";
+        else if (type == ZOO_DELETED_EVENT) event_type_str = "DELETED";
+        else if (type == ZOO_CHANGED_EVENT) event_type_str = "CHANGED";
+        else if (type == ZOO_CHILD_EVENT) event_type_str = "CHILD_CHANGED";
+
+        LOG(INFO) << "[ZK Event] Node Event: " << event_type_str << " | Path: " << (path ? path : "null");
+
         // 处理节点变动事件 (ZOO_CHANGED_EVENT, ZOO_DELETED_EVENT, etc.)
         client->InvokeNotifyHandler(type, path);
     }
@@ -108,8 +119,10 @@ void ZkClient::Start(int timeout_ms)
     if (zk_handle != nullptr) {
         return;
     }
-    std::string host = RpcApplication::GetInstance().GetConfig().GetString("zookeeper_ip");
-    std::string port = RpcApplication::GetInstance().GetConfig().GetString("zookeeper_port");
+
+    auto &config = RpcApplication::GetInstance().GetConfig();
+    std::string host = config.GetString("zookeeper_ip");
+    std::string port = config.GetString("zookeeper_port");
     std::string conn_str = host + ":" + port;
 
     /*
@@ -178,7 +191,7 @@ void ZkClient::Create(const char *path, const char *data, int datalen, int state
 bool ZkClient::GetChildren(const char *path, std::vector<std::string> &children, bool watch)
 {
     children.clear();
-    struct String_vector strings;
+    String_vector strings;
 
     // 调用 ZK C API：第三个参数 watch 设为 1 表示在该路径上挂载子节点监听
     // 当有 Provider 上线（新增子节点）或下线（删除子节点）时，会触发 ZOO_CHILD_EVENT

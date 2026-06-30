@@ -8,7 +8,8 @@
 class RpcApplication {
 public:
     static RpcApplication &GetInstance();
-    static void Init(int argc, char **argv); // 初始化框架，加载配置文件并启动 ZooKeeper 客户端
+    void Init(int argc, char **argv); // 初始化框架，加载配置文件并启动 ZooKeeper 客户端
+
     RpcConfig &GetConfig();
     ZkClient &GetZkClient();
 

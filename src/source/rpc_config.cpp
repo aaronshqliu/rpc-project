@@ -36,13 +36,27 @@ bool RpcConfig::LoadConfigFile(const std::string &fileName)
     return true;
 }
 
-std::string RpcConfig::GetString(const std::string &key) const
+std::string RpcConfig::GetString(const std::string &key, const std::string &default_val) const
 {
     auto it = config_map.find(key);
     if (it != config_map.end()) {
         return it->second;
     }
-    return "";
+    return default_val;
+}
+
+int RpcConfig::GetInt(const std::string &key, int default_val) const
+{
+    auto it = config_map.find(key);
+    if (it != config_map.end()) {
+        try {
+            return std::stoi(it->second);
+        } catch (const std::exception &e) {
+            LOG(ERROR) << "Config format error for key [" << key << "], using default value: " << default_val;
+            return default_val;
+        }
+    }
+    return default_val;
 }
 
 void RpcConfig::Trim(std::string &str)

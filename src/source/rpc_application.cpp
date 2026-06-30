@@ -48,7 +48,7 @@ void RpcApplication::Init(int argc, char **argv)
         exit(EXIT_FAILURE);
     }
 
-    if (!GetInstance().config.LoadConfigFile(config_file)) {
+    if (!config.LoadConfigFile(config_file)) {
         LOG(ERROR) << "Failed to load config file: " << config_file;
         exit(EXIT_FAILURE);
     }
@@ -59,7 +59,7 @@ void RpcApplication::Init(int argc, char **argv)
     muduo::Logger::setLogLevel(muduo::Logger::WARN);
 
     // 启动 ZooKeeper 客户端，阻塞等待连接成功
-    GetInstance().zk_client.Start();
+    zk_client.Start();
 }
 
 RpcConfig &RpcApplication::GetConfig()

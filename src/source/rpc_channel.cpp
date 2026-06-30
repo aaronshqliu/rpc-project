@@ -76,7 +76,7 @@ void MyRpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method
 
     for (int i = 1; i <= max_retries; ++i) {
         // 4.1 每次循环都重新获取地址 (触发轮询负载均衡算法)
-        ServiceHost host = QueryZkForHost(service_name, method_name);
+        RpcEndpoint host = QueryZkForHost(service_name, method_name);
         if (host.ip.empty()) {
             // 快速失败
             // 既然命中了空占位符，说明知道服务全挂了。
@@ -88,7 +88,7 @@ void MyRpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method
         }
 
         // 4.2 从连接池获取连接
-        client_fd = ConnectionPool::GetInstance().GetConnection(host.ip, host.port);
+        client_fd = ConnectionPool::GetInstance().GetConnection(host);
         if (client_fd == -1) {
             LOG(ERROR) << "GetConnection failed for " << host.ip << ":" << host.port 
                        << " | errno: " << errno << " (" << strerror(errno) << ")";
@@ -110,7 +110,7 @@ void MyRpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method
         // 5. 连接成功，跳出重试循环，进入数据收发阶段
         // 注意：数据发送失败不自动重试，防止非幂等操作重复执行
         if (send(client_fd, send_buf.c_str(), send_buf.size(), 0) == -1) {  // 发送失败：说明连接已损坏，必须销毁，不能放回连接池。
-            ConnectionPool::GetInstance().CloseConnection(host.ip, host.port, client_fd);
+            ConnectionPool::GetInstance().CloseConnection(host, client_fd);
             controller->SetFailed("Send RPC request failed!");
             return;
         }
@@ -119,15 +119,15 @@ void MyRpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method
         // 注意：服务端响应为了保持高效，通常不需要加魔数，保持极简即可。
         uint32_t recv_total_size = 0;
         // 先精准读取前 4 个字节，获取后面的总长度
-        if (net_utils::recv_exact(client_fd, (char *)&recv_total_size, 4) != 4) {  
-            ConnectionPool::GetInstance().CloseConnection(host.ip, host.port, client_fd);
+        if (net_utils::recv_exact(client_fd, (char *)&recv_total_size, 4) != 4) {
+            ConnectionPool::GetInstance().CloseConnection(host, client_fd);
             controller->SetFailed("Recv response total_size timeout or failed!");
             return;
         }
 
         recv_total_size = ntohl(recv_total_size);       // 转回主机字节序
         if (recv_total_size > 64 * 1024 * 1024) {       // 限制 RPC 响应最大为 64MB
-            ConnectionPool::GetInstance().CloseConnection(host.ip, host.port, client_fd);
+            ConnectionPool::GetInstance().CloseConnection(host, client_fd);
             controller->SetFailed("Response size too large!");
             return;
         }
@@ -144,7 +144,7 @@ void MyRpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method
             myrpc::RpcResponseHeader resp_header;
             if (!resp_header.ParseFromArray(&recv_buf[4], header_size)) {
                 controller->SetFailed("Parse RpcResponseHeader error!");
-                ConnectionPool::GetInstance().CloseConnection(host.ip, host.port, client_fd);
+                ConnectionPool::GetInstance().CloseConnection(host, client_fd);
                 return;
             }
 
@@ -153,7 +153,7 @@ void MyRpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method
                 // 如果 errcode != 0，说明业务逻辑根本没执行（比如服务没找到）
                 controller->SetFailed("RPC Framework Error: " + resp_header.errmsg());
                 // 注意：这里连接是健康的，只是逻辑报错，千万别销毁连接，放回连接池！
-                ConnectionPool::GetInstance().ReleaseConnection(host.ip, host.port, client_fd);
+                ConnectionPool::GetInstance().ReleaseConnection(host, client_fd);
                 return; // 直接退出，不需要再解析 Response Data 了
             }
 
@@ -163,14 +163,14 @@ void MyRpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method
             if (!response->ParseFromArray(&recv_buf[4 + header_size], data_size)) {   
                 controller->SetFailed("Parse business response data error!");
                 // 业务数据错乱，安全起见销毁连接
-                ConnectionPool::GetInstance().CloseConnection(host.ip, host.port, client_fd);
+                ConnectionPool::GetInstance().CloseConnection(host, client_fd);
             } else {  
                 // RPC 调用彻底成功，将健康的连接放回池中复用！
                 rpc_success = true;
-                ConnectionPool::GetInstance().ReleaseConnection(host.ip, host.port, client_fd);
+                ConnectionPool::GetInstance().ReleaseConnection(host, client_fd);
             }
         } else {
-            ConnectionPool::GetInstance().CloseConnection(host.ip, host.port, client_fd);
+            ConnectionPool::GetInstance().CloseConnection(host, client_fd);
             controller->SetFailed("Recv response data timeout or incomplete!");
             return;
         }
@@ -195,7 +195,7 @@ void MyRpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method
     // 函数执行到最后一行自然结束，局部变量 guard 出栈，自动触发 done->Run()
 }
 
-MyRpcChannel::ServiceHost MyRpcChannel::QueryZkForHost(const std::string &service_name, const std::string &method_name)
+RpcEndpoint MyRpcChannel::QueryZkForHost(const std::string &service_name, const std::string &method_name)
 {
     std::string path = "/" + service_name + "/" + method_name;
 
@@ -250,7 +250,7 @@ MyRpcChannel::ServiceHost MyRpcChannel::QueryZkForHost(const std::string &servic
             }
 
             // 情况 C：查询成功且有节点，解析并更新缓存
-            std::vector<ServiceHost> parsed_hosts = ParseHostStrings(available_hosts);
+            std::vector<RpcEndpoint> parsed_hosts = ParseHostStrings(available_hosts);
             if (!parsed_hosts.empty()) {
                 node_list = std::make_shared<ServiceNodeList>();
                 node_list->hosts = std::move(parsed_hosts);
@@ -283,15 +283,35 @@ void MyRpcChannel::PreFetchService(const std::string &service_name, const std::s
     QueryZkForHost(service_name, method_name);
 }
 
-MyRpcChannel::ServiceHost MyRpcChannel::GetHostByRoundRobin(std::shared_ptr<ServiceNodeList> list)
+RpcEndpoint MyRpcChannel::GetHostByRoundRobin(std::shared_ptr<ServiceNodeList> list)
 {
     // std::memory_order_relaxed: 只关心原子自增，不关心内存屏障同步，这样性能最高
     uint32_t idx = list->next_idx.fetch_add(1, std::memory_order_relaxed);
     return list->hosts[idx % list->hosts.size()];
 }
 
-void MyRpcChannel::RemoveInvalidHost(const std::string &path, const ServiceHost &invalid_host)
+void MyRpcChannel::RemoveInvalidHost(const std::string &path, const RpcEndpoint &invalid_host)
 {
+    int quarantine_time = RpcApplication::GetInstance().GetConfig().GetInt("quarantine_timeout_sec", 30);
+
+    // 1. 先进入黑名单 30 秒隔离期
+    {
+        std::lock_guard<std::mutex> q_lock(quarantine_mutex);
+
+        auto now = std::chrono::steady_clock::now();
+        auto it = quarantine_list.find(invalid_host);
+
+        // 如果节点已经在黑名单中，并且还没到期，说明已经被前面某个线程拉黑过了，当前线程直接返回
+        if (it != quarantine_list.end() && now < it->second) {
+            return;
+        }
+
+        // 第一次拉黑
+        quarantine_list[invalid_host] = std::chrono::steady_clock::now() + std::chrono::seconds(quarantine_time);
+        LOG(WARNING) << "Host " << invalid_host.ToString() << " is quarantined for 30s.";
+    }
+
+    // 2. COW 写时复制更新路由
     // 获取独占写锁，保护 host_cache 这个 Map 结构
     std::unique_lock<std::shared_mutex> write_lock(cache_mutex);
     auto it = host_cache.find(path);
@@ -328,35 +348,46 @@ void MyRpcChannel::BackgroundRefreshCache(const std::string &path)
     ZkClient &zk = RpcApplication::GetInstance().GetZkClient();
     std::vector<std::string> new_host_strs;
 
-    // 1. 重新向 ZK 拉取最新的节点列表（注意 watch 参数依然为 true，为了监听下一次变化）
+    // 1. 重新向 ZK 拉取最新的节点列表（watch 参数依然为 true，为了监听下一次变化）
     if (!zk.GetChildren(path.c_str(), new_host_strs, true)) {
         // 如果 ZK 查询报错（网络问题等），不清空缓存，而是保留旧缓存继续使用，这叫“容错降级”。
         LOG(WARNING) << "ZK update failed, keeping STALE cache for path: " << path;
         return;
     }
 
-    // 2. 解析新的节点数据
-    std::vector<ServiceHost> parsed_hosts = ParseHostStrings(new_host_strs);
-    int new_node_count = parsed_hosts.size();
+    // 2. 解析新的节点数据，并执行黑名单惰性过滤
+    std::vector<RpcEndpoint> parsed_hosts = ParseHostStrings(new_host_strs);
+    std::vector<RpcEndpoint> healthy_hosts;
+
+    for (const auto &host : parsed_hosts) {
+        if (!IsHostQuarantined(host)) {
+            healthy_hosts.emplace_back(host);
+        } else {
+            LOG(INFO) << "[Service Discovery] Host " << host.ToString() 
+                      << " is currently quarantined. Ignoring ZK update.";
+        }
+    }
+
+    int new_node_count = healthy_hosts.size();
     LOG(INFO) << "--------------------------------------------------";
     LOG(INFO) << "[Service Discovery] Path: " << path << " (NODE CHANGED)";
     LOG(INFO) << "[Service Discovery] Status: " << (new_node_count > 0 ? "ONLINE" : "OFFLINE");
     LOG(INFO) << "[Service Discovery] Instances Found: " << new_node_count;
     LOG(INFO) << "--------------------------------------------------";
 
-    // 3. 如果全宕机了，保留缓存键，塞入空列表挡住洪峰，防止缓存击穿
-    if (parsed_hosts.empty()) {
+    // 3. 如果全宕机了，或者 ZK 返回的节点全部都在黑名单里，保留缓存键，塞入空列表挡住洪峰，防止缓存击穿
+    if (healthy_hosts.empty()) {
         auto empty_list = std::make_shared<ServiceNodeList>();
 
         std::unique_lock<std::shared_mutex> write_lock(cache_mutex);
         host_cache[path] = empty_list; // 覆盖旧缓存，而不是 erase
-        LOG(WARNING) << "All nodes down for path: " << path << ". Empty cache updated.";
+        LOG(WARNING) << "All nodes down (or quarantined) for path: " << path << ". Empty cache updated.";
         return;
     }
 
     // 4. 写时复制，创建新列表，平滑替换旧列表
     auto new_list = std::make_shared<ServiceNodeList>();
-    new_list->hosts = std::move(parsed_hosts);
+    new_list->hosts = std::move(healthy_hosts);  // 将过滤后的健康节点集合移入新列表
     {
         std::unique_lock<std::shared_mutex> write_lock(cache_mutex);
         // 继承旧的轮询计数器，保证负载均衡不断档
@@ -369,19 +400,46 @@ void MyRpcChannel::BackgroundRefreshCache(const std::string &path)
     }
 }
 
-std::vector<MyRpcChannel::ServiceHost> MyRpcChannel::ParseHostStrings(const std::vector<std::string> &host_strs)
+std::vector<RpcEndpoint> MyRpcChannel::ParseHostStrings(const std::vector<std::string> &host_strs)
 {
-    std::vector<ServiceHost> parsed_hosts;
+    std::vector<RpcEndpoint> parsed_hosts;
     for (const auto &host_str : host_strs) {
         size_t idx = host_str.find(":");
         if (idx != std::string::npos) {
-            ServiceHost host;
-            host.ip = host_str.substr(0, idx);
-            host.port = static_cast<uint16_t>(std::stoi(host_str.substr(idx + 1)));
-            parsed_hosts.emplace_back(host);
+            RpcEndpoint host;
+            std::string ip = host_str.substr(0, idx);
+            uint16_t port = static_cast<uint16_t>(std::stoi(host_str.substr(idx + 1)));
+            parsed_hosts.emplace_back(ip, port);
         } else {
-            LOG(ERROR) << "Invalid host data format from ZK: " << host_str;
+            LOG(ERROR) << "Invalid host data format from ZK (missing ':'): " << host_str;
         }
     }
     return parsed_hosts;
+}
+
+bool MyRpcChannel::IsHostQuarantined(const RpcEndpoint &endpoint) 
+{
+    // 加上独立的局部锁，保护黑名单 Map 的并发读写
+    std::lock_guard<std::mutex> lock(quarantine_mutex);
+
+    auto it = quarantine_list.find(endpoint);
+
+    // 如果节点在黑名单里找到了
+    if (it != quarantine_list.end()) {
+        auto now = std::chrono::steady_clock::now();
+
+        // 比较当前时间与设定的解禁时间
+        if (now < it->second) {
+            // 时间还没到，拒绝放行
+            return true; 
+        } else {
+            // 惰性清理
+            // 时间已经过了，就在它被查询的这一刻，把它从黑名单里删掉。
+            quarantine_list.erase(it);
+            return false;
+        }
+    }
+
+    // 压根不在黑名单里，直接放行
+    return false;
 }

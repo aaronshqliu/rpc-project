@@ -4,13 +4,15 @@
 #include "rpc_header.pb.h"
 
 #include <arpa/inet.h>
+#include <poll.h>
+#include <fcntl.h>
 #include <glog/logging.h>
 #include <netinet/tcp.h>
 
 ConnectionPool& ConnectionPool::GetInstance()
 {
-    static ConnectionPool pool;
-    return pool;
+    static ConnectionPool instance;
+    return instance;
 }
 
 ConnectionPool::~ConnectionPool()
@@ -76,7 +78,8 @@ bool ConnectionPool::Ping(int fd)
 
     uint32_t magic_num = 0x12345678;
     uint32_t header_size = header_str.size();
-    uint32_t total_size = 4 + header_size; // Ping 也没有 Args
+    // 协议前缀 12 字节 (4+4+4) + 变长 header_size + 0 字节 Args
+    uint32_t total_size = 12 + header_size; // Ping 也没有 Args
 
     uint32_t net_magic_num = htonl(magic_num);
     uint32_t net_total_size = htonl(total_size);
@@ -95,44 +98,52 @@ bool ConnectionPool::Ping(int fd)
 
     // 接收 Pong
     // 响应协议是：[4字节总长度] + [4字节Header长度] + [RpcResponseHeader]
-    uint32_t net_recv_total_size = 0;
-    if (net_utils::recv_exact(fd, (char *)&net_recv_total_size, 4) != 4) {
+    char recv_prefix[8];
+    // 先严格读满 8 字节前缀 (总长度 + 头长度)
+    if (net_utils::recv_exact(fd, recv_prefix, 8) != 8) {
         return false;
     }
-    uint32_t recv_total_size = ntohl(net_recv_total_size);
+    
+    uint32_t recv_total_size = ntohl(*(uint32_t*)(&recv_prefix[0]));
+    uint32_t recv_header_size = ntohl(*(uint32_t*)(&recv_prefix[4]));
 
-    std::string recv_buf;
-    recv_buf.resize(recv_total_size);
-    if (net_utils::recv_exact(fd, &recv_buf[0], recv_total_size) != recv_total_size) {
+    // 计算还需要读多少字节的 Header 
+    std::string recv_header_buf;
+    recv_header_buf.resize(recv_header_size);
+    if (net_utils::recv_exact(fd, &recv_header_buf[0], recv_header_size) != recv_header_size) {
         return false;
     }
-
-    uint32_t recv_header_size = ntohl(*(uint32_t*)(&recv_buf[0]));
     
     myrpc::RpcResponseHeader pong_header;
-    if (pong_header.ParseFromArray(&recv_buf[4], recv_header_size)) {
-        // 校验确实是 PONG
+    if (pong_header.ParseFromArray(recv_header_buf.data(), recv_header_size)) {
         if (pong_header.msg_type() == myrpc::PONG && pong_header.errcode() == 0) {
-            return true; // 连接绝对健康
+            
+            // 排空脏数据
+            uint32_t remaining_bytes = recv_total_size - 8 - recv_header_size;
+            if (remaining_bytes > 0) {
+                std::string dump_buf;
+                dump_buf.resize(remaining_bytes);
+                net_utils::recv_exact(fd, &dump_buf[0], remaining_bytes);
+            }
+            
+            return true; 
         }
     }
 
     return false;
 }
 
-int ConnectionPool::GetConnection(const std::string &ip, uint16_t port)
+int ConnectionPool::GetConnection(const RpcEndpoint &endpoint)
 {
-    std::string key = ip + ":" + std::to_string(port);
-
     while (true) {
         HostPool *hp = nullptr;
         // 【第一阶段：全局锁】只负责查字典
         {
             std::lock_guard<std::mutex> global_lock(global_mutex);
-            if (pool.find(key) == pool.end()) {
-                pool[key] = std::make_unique<HostPool>();
+            if (pool.find(endpoint) == pool.end()) {
+                pool[endpoint] = std::make_unique<HostPool>();
             }
-            hp = pool[key].get();
+            hp = pool[endpoint].get();
         } // 全局锁释放，此时请求不同 IP 的线程彻底分道扬镳
 
         int fd = -1;
@@ -160,7 +171,7 @@ int ConnectionPool::GetConnection(const std::string &ip, uint16_t port)
 
         // 【第三阶段：无锁操作】去底层建连或执行 Ping
         if (need_create) {
-            fd = CreateNewConnection(ip, port);
+            fd = CreateNewConnection(endpoint);
             if (fd == -1) {
                 // 建连失败，重获局部锁退回名额
                 std::lock_guard<std::mutex> local_lock(hp->pool_mutex);
@@ -182,7 +193,7 @@ int ConnectionPool::GetConnection(const std::string &ip, uint16_t port)
             } else {
                 // 心跳失败，关闭死连接。
                 // 此时还在 while(true) 循环内，会自动进入下一次循环，去池子里拿下一个
-                CloseConnection(ip, port, fd);
+                CloseConnection(endpoint, fd);
                 continue;
             }
         } else {
@@ -192,19 +203,18 @@ int ConnectionPool::GetConnection(const std::string &ip, uint16_t port)
     }
 }
 
-void ConnectionPool::ReleaseConnection(const std::string &ip, uint16_t port, int fd)
+void ConnectionPool::ReleaseConnection(const RpcEndpoint &endpoint, int fd)
 {
     if (fd == -1) {
         return;
     }
 
-    std::string key = ip + ":" + std::to_string(port);
     HostPool* hp = nullptr;
 
     {
         std::lock_guard<std::mutex> global_lock(global_mutex);
-        if (pool.find(key) != pool.end()) {
-            hp = pool[key].get();
+        if (pool.find(endpoint) != pool.end()) {
+            hp = pool[endpoint].get();
         }
     }
 
@@ -216,17 +226,16 @@ void ConnectionPool::ReleaseConnection(const std::string &ip, uint16_t port, int
     }
 }
 
-void ConnectionPool::CloseConnection(const std::string &ip, uint16_t port, int fd)
+void ConnectionPool::CloseConnection(const RpcEndpoint &endpoint, int fd)
 {
     if (fd != -1) {
         close(fd); 
-        std::string key = ip + ":" + std::to_string(port);
         HostPool* hp = nullptr;
 
         {
             std::lock_guard<std::mutex> global_lock(global_mutex);
-            if (pool.find(key) != pool.end()) {
-                hp = pool[key].get();
+            if (pool.find(endpoint) != pool.end()) {
+                hp = pool[endpoint].get();
             }
         }
 
@@ -239,37 +248,78 @@ void ConnectionPool::CloseConnection(const std::string &ip, uint16_t port, int f
     }
 }
 
-int ConnectionPool::CreateNewConnection(const std::string &ip, uint16_t port)
+int ConnectionPool::CreateNewConnection(const RpcEndpoint &endpoint)
 {
     int client_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (client_fd == -1) {
         return -1;
     }
 
-    // 1. 设置收发超时
+    // 1. 设置 socket 为非阻塞模式
+    int flags = fcntl(client_fd, F_GETFL, 0);
+    if (flags == -1) {
+        close(client_fd);
+        return -1;
+    }
+    if (fcntl(client_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+        close(client_fd);
+        return -1;
+    }
+
+    struct sockaddr_in server_addr;
+    std::memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(endpoint.port);
+    server_addr.sin_addr.s_addr = inet_addr(endpoint.ip.c_str());
+
+    // 2. 发起非阻塞 connect
+    int ret = connect(client_fd, (struct sockaddr *)&server_addr, sizeof(server_addr));
+    if (ret == -1) {
+        if (errno == EINPROGRESS) {
+            // 三次握手正在进行中，使用 poll 监听可写事件
+            struct pollfd pfd;
+            pfd.fd = client_fd;
+            pfd.events = POLLOUT;
+
+            // 控制建連超時為 5000 毫秒（5秒）
+            int poll_ret = poll(&pfd, 1, 5000); 
+            if (poll_ret <= 0) { 
+                // poll_ret == 0 表示超時，< 0 表示 poll 出錯
+                close(client_fd);
+                return -1;
+            }
+            
+            // 檢查 socket 錯誤狀態以確認是否真正建連成功
+            int err = 0;
+            socklen_t errlen = sizeof(err);
+            if (getsockopt(client_fd, SOL_SOCKET, SO_ERROR, &err, &errlen) < 0 || err != 0) {
+                close(client_fd);
+                return -1;
+            }
+        } else {
+            // 其他直接失敗的錯誤（如 Network is unreachable）
+            close(client_fd);
+            return -1;
+        }
+    }
+
+    // 3. 建連成功後，恢復為原來的阻塞模式，交由 SO_RCVTIMEO/SO_SNDTIMEO 控制常規讀寫超時
+    if (fcntl(client_fd, F_SETFL, flags) == -1) {
+        close(client_fd);
+        return -1;
+    }
+
     struct timeval tv;
     tv.tv_sec = 5;
     tv.tv_usec = 0;
     setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
     setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof(tv));
 
-    // 2. 禁用 TCP 的 Nagle 算法
+    // 禁用 TCP 的 Nagle 算法
     // Nagle 算法会把小包凑成大包再发，这会导致 RPC 调用（通常是几十字节的小包）产生 40ms 的延迟！
     // 工业级 RPC 框架（gRPC, Dubbo）都会默认开启 TCP_NODELAY。
     int opt_val = 1;
     setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &opt_val, sizeof(opt_val));
 
-    // 3. 建立连接
-    struct sockaddr_in server_addr;
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(port);
-    server_addr.sin_addr.s_addr = inet_addr(ip.c_str());
-
-    if (connect(client_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1) {
-        close(client_fd);
-        return -1;
-    }
-
-    // 直接返回 fd 给业务方使用
     return client_fd;
 }

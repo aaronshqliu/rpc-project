@@ -83,9 +83,9 @@ void RpcProvider::Run()
 
         // 第二步：保持 muduo 运行，超时兜底 5 秒
         {
-            std::unique_lock<std::mutex> lock(shutdown_mutex);
-            if (bool clean_exit = shutdown_cv.wait_for(lock, std::chrono::seconds(5), [] {
-                return active_request_count.load(std::memory_order_relaxed) == 0;
+            std::unique_lock<std::mutex> lock(this->shutdown_mutex);
+            if (bool clean_exit = this->shutdown_cv.wait_for(lock, std::chrono::seconds(5), [this] {
+                return this->active_request_count.load(std::memory_order_relaxed) == 0;
             }); clean_exit) {
                 LOG(INFO) << "All in-flight requests completed gracefully. Exiting immediately.";
             } else {
@@ -101,18 +101,30 @@ void RpcProvider::Run()
     LOG(INFO) << "RpcProvider is running...";
 
     // 读取配置（IP + port）
-    ip = RpcApplication::GetInstance().GetConfig().GetString("rpc_server_ip");
-    port = atoi(RpcApplication::GetInstance().GetConfig().GetString("rpc_server_port").c_str());
+    auto &config = RpcApplication::GetInstance().GetConfig();
+    std::string ip = config.GetString("rpc_server_ip");
+    uint16_t port = config.GetInt("rpc_server_port");
+    server_name = config.GetString("server_name");
+    server_endpoint.ip = ip;
+    server_endpoint.port = port;
+    // 监控端口 = 业务端口 + 10000
+    uint16_t metrics_port = port + 10000;
 
-    muduo::net::InetAddress address(ip, port);
-    tcp_server = std::make_unique<muduo::net::TcpServer>(&event_loop, address, "RpcProvider");
+    muduo::net::InetAddress rpc_address(ip, port);
+    tcp_server = std::make_unique<muduo::net::TcpServer>(&event_loop, rpc_address, "RpcProvider");
 
     // 绑定连接回调和消息回调，分离网络连接业务和消息处理业务
     tcp_server->setConnectionCallback(std::bind(&RpcProvider::OnConnection, this, std::placeholders::_1));
-    tcp_server->setMessageCallback(
-        std::bind(&RpcProvider::OnMessage, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
+    tcp_server->setMessageCallback(std::bind(&RpcProvider::OnMessage, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
+
+    // 启动 Metrics HTTP Server
+    muduo::net::InetAddress metrics_address(ip, metrics_port);
+    http_server = std::make_unique<muduo::net::HttpServer>(&event_loop, metrics_address, "MetricsServer");
+    http_server->setHttpCallback(std::bind(&RpcProvider::OnMetricsRequest, this, std::placeholders::_1, std::placeholders::_2));
+
     tcp_server->setThreadNum(4);
     tcp_server->start();
+    http_server->start();
 
     // 设置重连回调并注册
     ZkClient &zk = RpcApplication::GetInstance().GetZkClient();
@@ -128,8 +140,7 @@ void RpcProvider::Run()
 void RpcProvider::RegisterServiceToZk()
 {
     ZkClient &zk = RpcApplication::GetInstance().GetZkClient();
-    std::string port_str = std::to_string(port);
-    std::string host_data = ip + ":" + port_str;
+    std::string host_data = server_endpoint.ToString();
 
     for (auto &[service_name, service_info] : service_map) {
         for (auto &[method_name, method_desc] : service_info.method_map) {
@@ -192,7 +203,7 @@ void RpcProvider::OnMessage(const muduo::net::TcpConnectionPtr &conn,
 
         // 6. 提取 Args 二进制流 (偏移量为 12 + header_size)
         uint32_t args_size = request_header.args_size();
-        
+
         if (4 + header_size + args_size != total_size) {  // 校验协议包的数据大小是否被篡改或越界
             LOG(ERROR) << "Protocol size mismatch! Packet corrupted.";
             conn->shutdown();
@@ -292,14 +303,14 @@ void RpcProvider::OnMessage(const muduo::net::TcpConnectionPtr &conn,
         auto response = service->GetResponsePrototype(method).New();
 
         // 将响应回调分发给业务逻辑
-        RpcClosure *done = new RpcClosure([conn, request, response]() {
+        RpcClosure *done = new RpcClosure([this, conn, request, response]() {
             if (!conn->connected()) {
                 LOG(WARNING) << "Client disconnected before sending response. Aborting serialize.";
                 delete request;
                 delete response;
 
                 // 如果客户端提前断开，请求作废，活跃请求 -1
-                DecrementActiveRequest();
+                this->DecrementActiveRequest();
                 return;
             }
 
@@ -338,13 +349,49 @@ void RpcProvider::OnMessage(const muduo::net::TcpConnectionPtr &conn,
             delete response;
 
             // 正常响应发送完毕并清理内存后，活跃请求 -1
-            DecrementActiveRequest();
+            this->DecrementActiveRequest();
         });
 
         // 准备将请求交给业务层，活跃请求 +1
         IncrementActiveRequest();
 
+        total_requests.fetch_add(1, std::memory_order_relaxed);
+
         // 调用业务逻辑：Register、Login、MakeOrder等，这里可以放到线程池中完成
         service->CallMethod(method, nullptr, request, response, done);
+    }
+}
+
+void RpcProvider::OnMetricsRequest(const muduo::net::HttpRequest& req, muduo::net::HttpResponse* resp)
+{
+    // 只响应 /metrics 路径
+    if (req.path() == "/metrics") {
+        std::string body;
+
+        // 1. 暴露总吞吐量 (Counter)
+        body += "# HELP rpc_requests_total Total number of RPC requests received.\n";
+        body += "# TYPE rpc_requests_total counter\n";
+        body += "rpc_requests_total{server=\"" + server_name + "\"} " + std::to_string(total_requests.load(std::memory_order_relaxed)) + "\n";
+
+        // 2. 暴露错误量 (Counter)
+        body += "# HELP rpc_requests_error Total number of failed RPC requests.\n";
+        body += "# TYPE rpc_requests_error counter\n";
+        body += "rpc_requests_error " + std::to_string(error_requests.load(std::memory_order_relaxed)) + "\n";
+
+        // 3. 暴露当前并发度 (Gauge)
+        body += "# HELP rpc_active_requests Number of requests currently in-flight.\n";
+        body += "# TYPE rpc_active_requests gauge\n";
+        body += "rpc_active_requests " + std::to_string(active_request_count.load(std::memory_order_relaxed)) + "\n";
+
+        // 返回 200 OK 和纯文本内容
+        resp->setStatusCode(muduo::net::HttpResponse::k200Ok);
+        resp->setStatusMessage("OK");
+        resp->setContentType("text/plain");
+        resp->setBody(body);
+    } else {
+        // 其他路径一律 404
+        resp->setStatusCode(muduo::net::HttpResponse::k404NotFound);
+        resp->setStatusMessage("Not Found");
+        resp->setCloseConnection(true);
     }
 }

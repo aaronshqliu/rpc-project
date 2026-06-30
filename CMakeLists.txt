@@ -51,6 +51,7 @@ target_compile_definitions(myrpc PRIVATE THREADED)
 # 配置 myrpc 需要链接的第三方库
 target_link_libraries(myrpc PUBLIC
     ${Protobuf_LIBRARIES}
+    muduo_http
     muduo_net
     muduo_base
     zookeeper_mt

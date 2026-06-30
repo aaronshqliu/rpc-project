@@ -1,6 +1,8 @@
 #ifndef RPC_CHANNEL_H
 #define RPC_CHANNEL_H
 
+#include "rpc_endpoint.h"
+
 #include <atomic>
 #include <google/protobuf/service.h>
 #include <shared_mutex>
@@ -21,30 +23,25 @@ public:
     void PreFetchService(const std::string &service_name, const std::string &method_name);
 
 private:
-    struct ServiceHost {
-        std::string ip;
-        uint16_t port;
-
-        bool operator!=(const ServiceHost &other) const
-        {
-            return ip != other.ip || port != other.port;
-        }
-    };
-
     // 将主机列表和独立的轮询计数器绑定在一起
     struct ServiceNodeList {
-        std::vector<ServiceHost> hosts;
+        std::vector<RpcEndpoint> hosts;
         std::atomic<uint32_t> next_idx {0}; // 专属这个服务节点的计数器，从 0 开始
     };
 
     std::unordered_map<std::string, std::shared_ptr<ServiceNodeList>> host_cache; // 缓存的是该方法下的【所有可用节点列表】
     std::shared_mutex cache_mutex;
 
-    ServiceHost QueryZkForHost(const std::string &service_name, const std::string &method_name);
-    void RemoveInvalidHost(const std::string &path, const ServiceHost &invalid_host);
+    // 死节点黑名单
+    std::unordered_map<RpcEndpoint, std::chrono::steady_clock::time_point, RpcEndpointHash> quarantine_list;
+    std::mutex quarantine_mutex;
+
+    bool IsHostQuarantined(const RpcEndpoint &endpoint);  // 检查指定节点是否还在黑名单隔离期内
+    RpcEndpoint QueryZkForHost(const std::string &service_name, const std::string &method_name);
+    void RemoveInvalidHost(const std::string &path, const RpcEndpoint &invalid_host);
     void BackgroundRefreshCache(const std::string &path);
-    ServiceHost GetHostByRoundRobin(std::shared_ptr<ServiceNodeList> list);
-    std::vector<ServiceHost> ParseHostStrings(const std::vector<std::string> &host_strs);
+    RpcEndpoint GetHostByRoundRobin(std::shared_ptr<ServiceNodeList> list);
+    std::vector<RpcEndpoint> ParseHostStrings(const std::vector<std::string> &host_strs);
 };
 
 #endif
